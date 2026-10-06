@@ -1,5 +1,3 @@
-import re
-
 from PySide6.QtWidgets import QApplication
 
 from microfleet.database import Database
@@ -23,10 +21,10 @@ def test_service_buttons_send_common_script_command(tmp_path, monkeypatch):
     window = MainWindow()
 
     class FakeSession:
-        commands: list[str] = []
+        commands: list[tuple[str, str]] = []
 
-        def send_command(self, command):
-            self.commands.append(command)
+        def send_managed_command(self, command, token):
+            self.commands.append((command, token))
             return True
 
     fake_session = FakeSession()
@@ -35,8 +33,12 @@ def test_service_buttons_send_common_script_command(tmp_path, monkeypatch):
         window._run_service_action(window.services[0], "restart", 0)
         window._run_all_action("status")
         assert len(fake_session.commands) == 2
-        assert "'/opt/my scripts/manage.sh' restart 'billing api'" in fake_session.commands[0]
-        assert "'/opt/my scripts/manage.sh' status all" in fake_session.commands[1]
+        assert "/opt/my scripts/manage.sh" in fake_session.commands[0][0]
+        assert "restart" in fake_session.commands[0][0]
+        assert "billing api" in fake_session.commands[0][0]
+        assert "/opt/my scripts/manage.sh" in fake_session.commands[1][0]
+        assert "status all" in fake_session.commands[1][0]
+        assert all("printf" not in command for command, _ in fake_session.commands)
     finally:
         window.close()
 
@@ -60,8 +62,8 @@ def test_status_output_updates_service_row(tmp_path, monkeypatch):
         def __init__(self):
             self.commands = []
 
-        def send_command(self, command):
-            self.commands.append(command)
+        def send_managed_command(self, command, token):
+            self.commands.append((command, token))
             return True
 
         def isRunning(self):
@@ -72,23 +74,17 @@ def test_status_output_updates_service_row(tmp_path, monkeypatch):
     window.sessions[server.id] = session
     try:
         window._run_service_action(window.services[0], "start", 0)
-        action_token = re.search(r"MF:BEGIN:([0-9a-f]{32})", session.commands[0]).group(1)
-        window._on_ssh_output(server.id, "user@host$ " + session.commands[0] + "\r\n")
-        window._on_ssh_output(
-            server.id,
-            f"\x1eMF:BEGIN:{action_token}\x1eStarted orders\n"
-            f"\x1eMF:END:{action_token}:0\x1e",
-        )
+        action_token = session.commands[0][1]
+        window._on_managed_output(server.id, action_token, "Started orders\n")
+        window._on_managed_finished(server.id, action_token, 0)
         assert len(session.commands) == 2
-        assert "/opt/manage.sh status orders" in session.commands[1]
-        status_token = re.search(r"MF:BEGIN:([0-9a-f]{32})", session.commands[1]).group(1)
-        window._on_ssh_output(server.id, "user@host$ " + session.commands[1] + "\r\n")
-        window._on_ssh_output(
-            server.id,
-            f"\x1eMF:BEGIN:{status_token}\x1e"
-            '\x1b[32mChecking service "orders" ..... running.\x1b[0m\n'
-            f"\x1eMF:END:{status_token}:0\x1e",
+        assert "/opt/manage.sh status orders" in session.commands[1][0]
+        status_token = session.commands[1][1]
+        window._on_managed_output(
+            server.id, status_token,
+            '\x1b[32mChecking service "orders" ..... running.\x1b[0m\n',
         )
+        window._on_managed_finished(server.id, status_token, 0)
         assert window.service_table.item(0, 2).text() == "Работает"
         assert "\x1b[32m" not in window.terminal.toPlainText()
         assert "printf" not in window.terminal.toPlainText()

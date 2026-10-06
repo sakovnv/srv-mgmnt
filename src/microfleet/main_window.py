@@ -31,8 +31,8 @@ from PySide6.QtWidgets import (
 from .database import Database
 from .dialogs import ServerDialog, ServiceDialog
 from .models import Microservice, Server
-from .ssh import ConnectionSecret, SSHSession, service_shell_command
-from .status import CommandResult, CommandStream, parse_all_statuses, parse_status, tracked_service_command
+from .ssh import ConnectionSecret, SSHSession, service_command, service_shell_command
+from .status import parse_all_statuses, parse_status
 from .terminal import AnsiTerminalRenderer
 
 
@@ -53,8 +53,8 @@ class MainWindow(QMainWindow):
         self.terminal_renderer = AnsiTerminalRenderer()
         self.server_states: dict[int, str] = {}
         self.service_statuses: dict[int, dict[str, str]] = {}
-        self.command_streams: dict[int, CommandStream] = {}
         self.pending_commands: dict[str, tuple[int, str, str]] = {}
+        self.pending_command_output: dict[str, list[str]] = {}
         self.passwords: dict[int, str] = {}
         self.sessions: dict[int, SSHSession] = {}
 
@@ -410,8 +410,11 @@ class MainWindow(QMainWindow):
             self._stop_session(server.id)
             self.db.delete_server(server.id)
             self.console_buffers.pop(server.id, None)
-            self.command_streams.pop(server.id, None)
             self.service_statuses.pop(server.id, None)
+            self.pending_command_output = {
+                token: output for token, output in self.pending_command_output.items()
+                if self.pending_commands.get(token, (None,))[0] != server.id
+            }
             self.pending_commands = {
                 token: command for token, command in self.pending_commands.items()
                 if command[0] != server.id
@@ -491,49 +494,50 @@ class MainWindow(QMainWindow):
         if session is None:
             return False
         token = uuid4().hex
-        command = tracked_service_command(script_path, action, target, token)
+        command = service_command(server, script_path, action, target)
         self.pending_commands[token] = (server.id or 0, action, target)
-        if session.send_command(command):
-            stream = self.command_streams.setdefault(server.id or 0, CommandStream())
-            stream.expect_echo(
-                token, command, service_shell_command(script_path, action, target)
+        self.pending_command_output[token] = []
+        if session.send_managed_command(command, token):
+            self._append_console(
+                server.id or 0,
+                f"\n$ {service_shell_command(script_path, action, target)}\n",
             )
             return True
         self.pending_commands.pop(token, None)
+        self.pending_command_output.pop(token, None)
         QMessageBox.warning(self, "SSH-сессия закрыта", "Подключитесь к серверу и повторите команду.")
         return False
 
-    def _on_ssh_output(self, server_id: int, text: str) -> None:
-        stream = self.command_streams.setdefault(server_id, CommandStream())
-        visible, results = stream.feed(text)
-        if visible:
-            self._append_console(server_id, visible)
-        for result in results:
-            self._on_managed_result(server_id, result)
+    def _on_managed_output(self, server_id: int, token: str, text: str) -> None:
+        if self.pending_commands.get(token, (None,))[0] != server_id:
+            return
+        self.pending_command_output[token].append(text)
+        self._append_console(server_id, text)
 
-    def _on_managed_result(self, server_id: int, result: CommandResult) -> None:
-        pending = self.pending_commands.pop(result.token, None)
+    def _on_managed_finished(self, server_id: int, token: str, exit_code: int) -> None:
+        pending = self.pending_commands.pop(token, None)
+        output = "".join(self.pending_command_output.pop(token, []))
         if pending is None or pending[0] != server_id:
             return
         _, action, target = pending
         if action == "status":
             if target == "all":
                 names = [service.name for service in self.db.list_services(server_id)]
-                parsed = parse_all_statuses(result.output, names)
+                parsed = parse_all_statuses(output, names)
                 for name in names:
-                    state = parsed.get(name, "error" if result.exit_code else "unknown")
+                    state = parsed.get(name, "error" if exit_code else "unknown")
                     self._set_service_status(server_id, name, state)
             else:
-                state = parse_status(result.output)
+                state = parse_status(output)
                 if state is None:
-                    state = "error" if result.exit_code else "unknown"
+                    state = "error" if exit_code else "unknown"
                 self._set_service_status(server_id, target, state)
             return
 
-        if result.exit_code:
+        if exit_code:
             self._append_console(
                 server_id,
-                f"\n[{self._timestamp()}] {action} {target}: код выхода {result.exit_code}\n",
+                f"\n[{self._timestamp()}] {action} {target}: код выхода {exit_code}\n",
             )
         session = self.sessions.get(server_id)
         server = next((item for item in self.servers if item.id == server_id), None)
@@ -547,7 +551,7 @@ class MainWindow(QMainWindow):
                 if target == "all" else [target]
             )
             for name in names:
-                self._set_service_status(server_id, name, "error" if result.exit_code else "unknown")
+                self._set_service_status(server_id, name, "error" if exit_code else "unknown")
 
     def _set_service_status(self, server_id: int, service_name: str, state: str) -> None:
         self.service_statuses.setdefault(server_id, {})[service_name] = state
@@ -621,8 +625,9 @@ class MainWindow(QMainWindow):
                 )
             return None
         session = SSHSession(server, ConnectionSecret(password), parent=self)
-        self.command_streams[server_id] = CommandStream()
-        session.output.connect(self._on_ssh_output)
+        session.output.connect(self._append_console)
+        session.managed_output.connect(self._on_managed_output)
+        session.managed_finished.connect(self._on_managed_finished)
         session.state.connect(self._on_server_state)
         session.session_finished.connect(partial(self._session_finished, session))
         self.sessions[server_id] = session
@@ -647,11 +652,25 @@ class MainWindow(QMainWindow):
     def _session_finished(self, session: SSHSession, server_id: int, reason: str) -> None:
         if self.sessions.get(server_id) is session:
             self.sessions.pop(server_id, None)
-            self.command_streams.pop(server_id, None)
+            interrupted = [
+                (action, target) for sid, action, target in self.pending_commands.values()
+                if sid == server_id
+            ]
+            self.pending_command_output = {
+                token: output for token, output in self.pending_command_output.items()
+                if self.pending_commands.get(token, (None,))[0] != server_id
+            }
             self.pending_commands = {
                 token: command for token, command in self.pending_commands.items()
                 if command[0] != server_id
             }
+            for action, target in interrupted:
+                if target == "all":
+                    names = [service.name for service in self.db.list_services(server_id)]
+                else:
+                    names = [target]
+                for name in names:
+                    self._set_service_status(server_id, name, "unknown")
         self._append_console(server_id, f"\n[{self._timestamp()}] {reason}\n")
 
     def _on_server_state(self, server_id: int, state: str) -> None:
