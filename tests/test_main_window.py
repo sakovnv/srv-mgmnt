@@ -73,6 +73,7 @@ def test_status_output_updates_service_row(tmp_path, monkeypatch):
     try:
         window._run_service_action(window.services[0], "start", 0)
         action_token = re.search(r"MF:BEGIN:([0-9a-f]{32})", session.commands[0]).group(1)
+        window._on_ssh_output(server.id, "user@host$ " + session.commands[0] + "\r\n")
         window._on_ssh_output(
             server.id,
             f"\x1eMF:BEGIN:{action_token}\x1eStarted orders\n"
@@ -81,6 +82,7 @@ def test_status_output_updates_service_row(tmp_path, monkeypatch):
         assert len(session.commands) == 2
         assert "/opt/manage.sh status orders" in session.commands[1]
         status_token = re.search(r"MF:BEGIN:([0-9a-f]{32})", session.commands[1]).group(1)
+        window._on_ssh_output(server.id, "user@host$ " + session.commands[1] + "\r\n")
         window._on_ssh_output(
             server.id,
             f"\x1eMF:BEGIN:{status_token}\x1e"
@@ -89,6 +91,8 @@ def test_status_output_updates_service_row(tmp_path, monkeypatch):
         )
         assert window.service_table.item(0, 2).text() == "Работает"
         assert "\x1b[32m" not in window.terminal.toPlainText()
+        assert "printf" not in window.terminal.toPlainText()
+        assert "/opt/manage.sh status orders" in window.terminal.toPlainText()
         assert 'Checking service "orders" ..... running.' in window.terminal.toPlainText()
     finally:
         window.sessions.pop(server.id)

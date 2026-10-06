@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from .database import Database
 from .dialogs import ServerDialog, ServiceDialog
 from .models import Microservice, Server
-from .ssh import ConnectionSecret, SSHSession
+from .ssh import ConnectionSecret, SSHSession, service_shell_command
 from .status import CommandResult, CommandStream, parse_all_statuses, parse_status, tracked_service_command
 from .terminal import AnsiTerminalRenderer
 
@@ -494,6 +494,10 @@ class MainWindow(QMainWindow):
         command = tracked_service_command(script_path, action, target, token)
         self.pending_commands[token] = (server.id or 0, action, target)
         if session.send_command(command):
+            stream = self.command_streams.setdefault(server.id or 0, CommandStream())
+            stream.expect_echo(
+                token, command, service_shell_command(script_path, action, target)
+            )
             return True
         self.pending_commands.pop(token, None)
         QMessageBox.warning(self, "SSH-сессия закрыта", "Подключитесь к серверу и повторите команду.")

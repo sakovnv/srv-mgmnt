@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import deque
 from dataclasses import dataclass
 
 from .ssh import clean_terminal_output, service_shell_command
@@ -16,6 +17,13 @@ class CommandResult:
     exit_code: int
 
 
+@dataclass(frozen=True, slots=True)
+class EchoExpectation:
+    token: str
+    command: str
+    display: str
+
+
 class CommandStream:
     """Remove command delimiters while collecting the corresponding PTY output."""
 
@@ -23,9 +31,15 @@ class CommandStream:
         self._pending = ""
         self._active_token: str | None = None
         self._captured: list[str] = []
+        self._expected_echoes: deque[EchoExpectation] = deque()
+        self._echo_candidate = ""
+        self._echo_position = 0
+
+    def expect_echo(self, token: str, command: str, display: str) -> None:
+        self._expected_echoes.append(EchoExpectation(token, command, display))
 
     def feed(self, chunk: str) -> tuple[str, list[CommandResult]]:
-        self._pending += chunk
+        self._pending += self._hide_command_echo(chunk)
         visible: list[str] = []
         results: list[CommandResult] = []
         while True:
@@ -36,6 +50,12 @@ class CommandStream:
                 self._pending = self._pending[marker.end():]
                 kind, token, code = marker.groups()
                 if kind == "BEGIN":
+                    # Some hosts disable TTY echo. Retire that expectation when
+                    # the command actually starts so it cannot hide later text.
+                    if self._expected_echoes and self._expected_echoes[0].token == token:
+                        self._expected_echoes.popleft()
+                        self._echo_candidate = ""
+                        self._echo_position = 0
                     self._active_token = token
                     self._captured = []
                 elif self._active_token == token:
@@ -55,6 +75,36 @@ class CommandStream:
                 self._emit(self._pending[:last_separator], visible)
                 self._pending = self._pending[last_separator:]
             return "".join(visible), results
+
+    def _hide_command_echo(self, chunk: str) -> str:
+        visible: list[str] = []
+        for char in chunk:
+            while True:
+                if not self._expected_echoes:
+                    visible.append(char)
+                    break
+                expected = self._expected_echoes[0]
+                if char == expected.command[self._echo_position]:
+                    self._echo_candidate += char
+                    self._echo_position += 1
+                    if self._echo_position == len(expected.command):
+                        visible.append(expected.display)
+                        self._expected_echoes.popleft()
+                        self._echo_candidate = ""
+                        self._echo_position = 0
+                    break
+                # PTYs may wrap a long echoed input line at the terminal width.
+                if self._echo_position and char in "\r\n":
+                    self._echo_candidate += char
+                    break
+                if self._echo_candidate:
+                    visible.append(self._echo_candidate)
+                    self._echo_candidate = ""
+                    self._echo_position = 0
+                    continue
+                visible.append(char)
+                break
+        return "".join(visible)
 
     def _emit(self, content: str, visible: list[str]) -> None:
         if content:
