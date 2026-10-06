@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from uuid import uuid4
 
 from PySide6.QtCore import QStandardPaths, Qt
 from PySide6.QtGui import QColor, QFont
@@ -31,8 +31,8 @@ from PySide6.QtWidgets import (
 from .database import Database
 from .dialogs import ServerDialog, ServiceDialog
 from .models import Microservice, Server
-from .ssh import ConnectionSecret, SSHSession, service_command, service_shell_command
-from .status import parse_all_statuses, parse_status
+from .ssh import ConnectionSecret, SSHSession, clean_terminal_output, service_shell_command
+from .status import parse_all_statuses
 from .terminal import AnsiTerminalRenderer
 
 
@@ -53,8 +53,7 @@ class MainWindow(QMainWindow):
         self.terminal_renderer = AnsiTerminalRenderer()
         self.server_states: dict[int, str] = {}
         self.service_statuses: dict[int, dict[str, str]] = {}
-        self.pending_commands: dict[str, tuple[int, str, str]] = {}
-        self.pending_command_output: dict[str, list[str]] = {}
+        self.status_line_buffers: dict[int, str] = {}
         self.passwords: dict[int, str] = {}
         self.sessions: dict[int, SSHSession] = {}
 
@@ -411,14 +410,7 @@ class MainWindow(QMainWindow):
             self.db.delete_server(server.id)
             self.console_buffers.pop(server.id, None)
             self.service_statuses.pop(server.id, None)
-            self.pending_command_output = {
-                token: output for token, output in self.pending_command_output.items()
-                if self.pending_commands.get(token, (None,))[0] != server.id
-            }
-            self.pending_commands = {
-                token: command for token, command in self.pending_commands.items()
-                if command[0] != server.id
-            }
+            self.status_line_buffers.pop(server.id, None)
             self.passwords.pop(server.id, None)
             self.active_server = None
             self._load_servers()
@@ -493,65 +485,25 @@ class MainWindow(QMainWindow):
         session = session or self._session_for_command(server)
         if session is None:
             return False
-        token = uuid4().hex
-        command = service_command(server, script_path, action, target)
-        self.pending_commands[token] = (server.id or 0, action, target)
-        self.pending_command_output[token] = []
-        if session.send_managed_command(command, token):
-            self._append_console(
-                server.id or 0,
-                f"\n$ {service_shell_command(script_path, action, target)}\n",
-            )
+        command = service_shell_command(script_path, action, target)
+        if session.send_command(command):
+            if action != "status":
+                session.send_command(service_shell_command(script_path, "status", target))
             return True
-        self.pending_commands.pop(token, None)
-        self.pending_command_output.pop(token, None)
         QMessageBox.warning(self, "SSH-сессия закрыта", "Подключитесь к серверу и повторите команду.")
         return False
 
-    def _on_managed_output(self, server_id: int, token: str, text: str) -> None:
-        if self.pending_commands.get(token, (None,))[0] != server_id:
-            return
-        self.pending_command_output[token].append(text)
+    def _on_ssh_output(self, server_id: int, text: str) -> None:
         self._append_console(server_id, text)
-
-    def _on_managed_finished(self, server_id: int, token: str, exit_code: int) -> None:
-        pending = self.pending_commands.pop(token, None)
-        output = "".join(self.pending_command_output.pop(token, []))
-        if pending is None or pending[0] != server_id:
-            return
-        _, action, target = pending
-        if action == "status":
-            if target == "all":
-                names = [service.name for service in self.db.list_services(server_id)]
-                parsed = parse_all_statuses(output, names)
-                for name in names:
-                    state = parsed.get(name, "error" if exit_code else "unknown")
-                    self._set_service_status(server_id, name, state)
-            else:
-                state = parse_status(output)
-                if state is None:
-                    state = "error" if exit_code else "unknown"
-                self._set_service_status(server_id, target, state)
-            return
-
-        if exit_code:
-            self._append_console(
-                server_id,
-                f"\n[{self._timestamp()}] {action} {target}: код выхода {exit_code}\n",
-            )
-        session = self.sessions.get(server_id)
-        server = next((item for item in self.servers if item.id == server_id), None)
-        if server and session and session.isRunning() and server.management_script_path:
-            self._send_managed_command(
-                server, server.management_script_path, "status", target, session=session
-            )
-        else:
-            names = (
-                [service.name for service in self.db.list_services(server_id)]
-                if target == "all" else [target]
-            )
-            for name in names:
-                self._set_service_status(server_id, name, "error" if exit_code else "unknown")
+        buffered = self.status_line_buffers.get(server_id, "") + text
+        lines = re.split(r"\r\n|\r|\n", buffered)
+        self.status_line_buffers[server_id] = lines.pop()[-4096:]
+        names = [service.name for service in self.db.list_services(server_id)]
+        for line in [*lines, self.status_line_buffers[server_id]]:
+            if not re.match(r"^\s*Checking\s+service\s+", clean_terminal_output(line), re.I):
+                continue
+            for name, state in parse_all_statuses(line, names).items():
+                self._set_service_status(server_id, name, state)
 
     def _set_service_status(self, server_id: int, service_name: str, state: str) -> None:
         self.service_statuses.setdefault(server_id, {})[service_name] = state
@@ -625,9 +577,8 @@ class MainWindow(QMainWindow):
                 )
             return None
         session = SSHSession(server, ConnectionSecret(password), parent=self)
-        session.output.connect(self._append_console)
-        session.managed_output.connect(self._on_managed_output)
-        session.managed_finished.connect(self._on_managed_finished)
+        self.status_line_buffers[server_id] = ""
+        session.output.connect(self._on_ssh_output)
         session.state.connect(self._on_server_state)
         session.session_finished.connect(partial(self._session_finished, session))
         self.sessions[server_id] = session
@@ -652,24 +603,9 @@ class MainWindow(QMainWindow):
     def _session_finished(self, session: SSHSession, server_id: int, reason: str) -> None:
         if self.sessions.get(server_id) is session:
             self.sessions.pop(server_id, None)
-            interrupted = [
-                (action, target) for sid, action, target in self.pending_commands.values()
-                if sid == server_id
-            ]
-            self.pending_command_output = {
-                token: output for token, output in self.pending_command_output.items()
-                if self.pending_commands.get(token, (None,))[0] != server_id
-            }
-            self.pending_commands = {
-                token: command for token, command in self.pending_commands.items()
-                if command[0] != server_id
-            }
-            for action, target in interrupted:
-                if target == "all":
-                    names = [service.name for service in self.db.list_services(server_id)]
-                else:
-                    names = [target]
-                for name in names:
+            self.status_line_buffers.pop(server_id, None)
+            for name, state in self.service_statuses.get(server_id, {}).copy().items():
+                if state == "checking":
                     self._set_service_status(server_id, name, "unknown")
         self._append_console(server_id, f"\n[{self._timestamp()}] {reason}\n")
 

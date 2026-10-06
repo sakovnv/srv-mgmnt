@@ -7,7 +7,6 @@ import socket
 import threading
 import time
 import codecs
-from collections import deque
 from dataclasses import dataclass
 
 from PySide6.QtCore import QThread, Signal
@@ -60,13 +59,11 @@ class ConnectionSecret:
 
 
 class SSHSession(QThread):
-    """Persistent interactive SSH terminal and separate service command channel."""
+    """Persistent interactive SSH terminal for one server."""
 
     output = Signal(int, str)
     state = Signal(int, str)
     session_finished = Signal(int, str)
-    managed_output = Signal(int, str, str)
-    managed_finished = Signal(int, str, int)
 
     def __init__(
         self,
@@ -88,12 +85,6 @@ class SSHSession(QThread):
         if self._stop_event.is_set():
             return False
         self._outgoing.put(("command", command.rstrip("\r\n") + "\n"))
-        return True
-
-    def send_managed_command(self, command: str, request_id: str) -> bool:
-        if self._stop_event.is_set():
-            return False
-        self._outgoing.put(("managed", (request_id, command)))
         return True
 
     def send_interrupt(self) -> bool:
@@ -119,10 +110,6 @@ class SSHSession(QThread):
         client = None
         channel = None
         reason = "SSH-сессия закрыта"
-        managed_queue: deque[tuple[str, str]] = deque()
-        managed_channel = None
-        managed_id = ""
-        managed_decoder = None
         try:
             import paramiko
 
@@ -160,24 +147,7 @@ class SSHSession(QThread):
 
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             while not self._stop_event.is_set() and not channel.closed:
-                self._flush_outgoing(channel, managed_queue, managed_channel)
-                if managed_channel is None and managed_queue:
-                    managed_id, command = managed_queue.popleft()
-                    try:
-                        transport = client.get_transport()
-                        if transport is None or not transport.is_active():
-                            raise ConnectionError("SSH-транспорт закрыт")
-                        managed_channel = transport.open_session(timeout=self.timeout)
-                        managed_channel.get_pty(term="xterm-256color", width=180, height=40)
-                        managed_channel.exec_command(command)
-                        managed_channel.settimeout(0.0)
-                        managed_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-                    except Exception as exc:
-                        if managed_channel is not None:
-                            managed_channel.close()
-                        managed_channel = None
-                        self.managed_output.emit(server_id, managed_id, f"Ошибка запуска: {exc}\n")
-                        self.managed_finished.emit(server_id, managed_id, -1)
+                self._flush_outgoing(channel)
                 received = False
                 while channel.recv_ready():
                     data = channel.recv(65535)
@@ -189,24 +159,6 @@ class SSHSession(QThread):
                     if text:
                         self.output.emit(server_id, text)
                     received = True
-                if managed_channel is not None:
-                    while managed_channel.recv_ready():
-                        data = managed_channel.recv(65535)
-                        if not data:
-                            break
-                        text = managed_decoder.decode(data)
-                        if text:
-                            self.managed_output.emit(server_id, managed_id, text)
-                        received = True
-                    if managed_channel.exit_status_ready() and not managed_channel.recv_ready():
-                        remainder = managed_decoder.decode(b"", final=True)
-                        if remainder:
-                            self.managed_output.emit(server_id, managed_id, remainder)
-                        code = managed_channel.recv_exit_status()
-                        managed_channel.close()
-                        managed_channel = None
-                        managed_decoder = None
-                        self.managed_finished.emit(server_id, managed_id, code)
                 if not received:
                     time.sleep(0.035)
             remainder = decoder.decode(b"", final=True)
@@ -218,8 +170,6 @@ class SSHSession(QThread):
             reason = str(exc)
         finally:
             self.state.emit(server_id, "offline")
-            if managed_channel is not None:
-                managed_channel.close()
             if channel is not None:
                 channel.close()
             if client is not None:
@@ -228,9 +178,7 @@ class SSHSession(QThread):
             self._client = None
             self.session_finished.emit(server_id, reason)
 
-    def _flush_outgoing(
-        self, channel: object, managed_queue: deque[tuple[str, str]], managed_channel: object
-    ) -> None:
+    def _flush_outgoing(self, channel: object) -> None:
         while True:
             try:
                 kind, payload = self._outgoing.get_nowait()
@@ -243,7 +191,5 @@ class SSHSession(QThread):
                 channel.resize_pty(width=width, height=height)
             elif kind == "command":
                 channel.sendall(str(payload).encode("utf-8"))
-            elif kind == "managed":
-                managed_queue.append(payload)
             elif kind == "raw":
-                (managed_channel or channel).sendall(payload)
+                channel.sendall(payload)

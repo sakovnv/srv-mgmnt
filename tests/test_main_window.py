@@ -21,10 +21,10 @@ def test_service_buttons_send_common_script_command(tmp_path, monkeypatch):
     window = MainWindow()
 
     class FakeSession:
-        commands: list[tuple[str, str]] = []
+        commands: list[str] = []
 
-        def send_managed_command(self, command, token):
-            self.commands.append((command, token))
+        def send_command(self, command):
+            self.commands.append(command)
             return True
 
     fake_session = FakeSession()
@@ -32,13 +32,12 @@ def test_service_buttons_send_common_script_command(tmp_path, monkeypatch):
     try:
         window._run_service_action(window.services[0], "restart", 0)
         window._run_all_action("status")
-        assert len(fake_session.commands) == 2
-        assert "/opt/my scripts/manage.sh" in fake_session.commands[0][0]
-        assert "restart" in fake_session.commands[0][0]
-        assert "billing api" in fake_session.commands[0][0]
-        assert "/opt/my scripts/manage.sh" in fake_session.commands[1][0]
-        assert "status all" in fake_session.commands[1][0]
-        assert all("printf" not in command for command, _ in fake_session.commands)
+        assert fake_session.commands == [
+            "'/opt/my scripts/manage.sh' restart 'billing api'",
+            "'/opt/my scripts/manage.sh' status 'billing api'",
+            "'/opt/my scripts/manage.sh' status all",
+        ]
+        assert all("printf" not in command for command in fake_session.commands)
     finally:
         window.close()
 
@@ -62,8 +61,8 @@ def test_status_output_updates_service_row(tmp_path, monkeypatch):
         def __init__(self):
             self.commands = []
 
-        def send_managed_command(self, command, token):
-            self.commands.append((command, token))
+        def send_command(self, command):
+            self.commands.append(command)
             return True
 
         def isRunning(self):
@@ -74,17 +73,13 @@ def test_status_output_updates_service_row(tmp_path, monkeypatch):
     window.sessions[server.id] = session
     try:
         window._run_service_action(window.services[0], "start", 0)
-        action_token = session.commands[0][1]
-        window._on_managed_output(server.id, action_token, "Started orders\n")
-        window._on_managed_finished(server.id, action_token, 0)
+        window._on_ssh_output(server.id, "$ /opt/manage.sh start orders\r\n")
+        window._on_ssh_output(server.id, "Started orders\n")
         assert len(session.commands) == 2
-        assert "/opt/manage.sh status orders" in session.commands[1][0]
-        status_token = session.commands[1][1]
-        window._on_managed_output(
-            server.id, status_token,
-            '\x1b[32mChecking service "orders" ..... running.\x1b[0m\n',
-        )
-        window._on_managed_finished(server.id, status_token, 0)
+        assert "/opt/manage.sh status orders" in session.commands[1]
+        window._on_ssh_output(server.id, "$ /opt/manage.sh status orders\r\n")
+        window._on_ssh_output(server.id, '\x1b[32mChecking service "ord')
+        window._on_ssh_output(server.id, 'ers" ..... running.\x1b[0m\n')
         assert window.service_table.item(0, 2).text() == "Работает"
         assert "\x1b[32m" not in window.terminal.toPlainText()
         assert "printf" not in window.terminal.toPlainText()
