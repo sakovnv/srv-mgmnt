@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtCore import QByteArray, QRectF, Qt
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 
@@ -29,9 +29,9 @@ def service_icon(name: str, color: str) -> QIcon:
     if not renderer.isValid():
         raise ValueError(f"Invalid SVG icon: {name}")
     pixmap = QPixmap(48, 48)
-    pixmap.setDevicePixelRatio(2)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
-    renderer.render(painter)
+    renderer.render(painter, QRectF(0, 0, 48, 48))
     painter.end()
+    pixmap.setDevicePixelRatio(2)
     return QIcon(pixmap)
