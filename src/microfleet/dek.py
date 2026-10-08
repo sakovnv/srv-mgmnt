@@ -50,19 +50,27 @@ class SecretRedactor:
     def __init__(self, password: str) -> None:
         self._patterns = sorted(set(split_dek_password(password)), key=len, reverse=True)
         self._tail = ""
-        self._longest = max(map(len, self._patterns))
 
     def feed(self, text: str) -> str:
         combined = self._tail + text
-        end = max(0, len(combined) - self._longest + 1)
-        for pattern in self._patterns:
-            position = combined.find(pattern)
-            while position >= 0:
-                if position < end < position + len(pattern):
-                    end = position
-                position = combined.find(pattern, position + 1)
-        visible, self._tail = combined[:end], combined[end:]
-        return self._replace(visible)
+        visible: list[str] = []
+        index = 0
+        while index < len(combined):
+            match = next(
+                (pattern for pattern in self._patterns if combined.startswith(pattern, index)),
+                None,
+            )
+            if match is not None:
+                visible.append("[DEK скрыт]")
+                index += len(match)
+                continue
+            remainder = combined[index:]
+            if any(pattern.startswith(remainder) for pattern in self._patterns):
+                break  # Only a possible prefix of a secret needs another SSH packet.
+            visible.append(combined[index])
+            index += 1
+        self._tail = combined[index:]
+        return "".join(visible)
 
     def finish(self) -> str:
         visible, self._tail = self._tail, ""

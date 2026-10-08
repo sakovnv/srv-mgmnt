@@ -130,6 +130,7 @@ def test_dek_prompts_are_answered_without_exposing_password(tmp_path, monkeypatc
         assert session.commands[1] == "abcd"
         window._on_ssh_output(server.id, "abcd\r\nEnter second password component:")
         assert session.commands[2] == "efgh"
+        assert "Enter second password component:" in window.terminal.toPlainText()
         window._on_ssh_output(server.id, "efgh\r\n")
         window._on_ssh_output(server.id, 'Checking service "orders" ..... running.\n')
         assert window.service_table.item(0, 2).text() == "Работает"

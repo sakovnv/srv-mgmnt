@@ -30,3 +30,15 @@ def test_dek_echo_is_redacted_across_packets():
     assert "efgh" not in visible
     assert "[DEK скрыт]" in visible
     assert "Checking service" in visible
+
+
+def test_complete_prompt_is_visible_without_waiting_for_more_output():
+    redactor = SecretRedactor("abcdefgh")
+    assert redactor.feed("Enter first password component:") == "Enter first password component:"
+    assert redactor.feed("\nEnter second password component:") == "\nEnter second password component:"
+
+
+def test_only_a_possible_secret_prefix_is_buffered():
+    redactor = SecretRedactor("abcdefgh")
+    assert redactor.feed("Prompt: ab") == "Prompt: "
+    assert redactor.feed("cd\n") == "[DEK скрыт]\n"
