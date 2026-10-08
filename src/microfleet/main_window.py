@@ -7,7 +7,7 @@ from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import QSize, QStandardPaths, Qt, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -129,8 +129,12 @@ class MainWindow(QMainWindow):
     def _build_workspace(self) -> QWidget:
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        self.workspace_splitter = splitter
+        self._saved_splitter_sizes: list[int] | None = None
 
         content = QWidget()
+        content.setMinimumWidth(440)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(28, 24, 26, 22)
         content_layout.setSpacing(16)
@@ -192,11 +196,16 @@ class MainWindow(QMainWindow):
         self.service_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.service_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.service_table.verticalHeader().setVisible(False)
-        self.service_table.verticalHeader().setDefaultSectionSize(62)
+        self.service_table.verticalHeader().setDefaultSectionSize(46)
         header = self.service_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        status_width = max(
+            QFontMetrics(self.service_table.font()).horizontalAdvance(label)
+            for label in ("Работает", "Остановлен", "Сбой", "Проверяется…", "Ошибка проверки", "Неизвестно")
+        ) + 28
+        header.resizeSection(2, status_width)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         content_layout.addWidget(self.service_table, 1)
@@ -211,13 +220,13 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(content)
         splitter.addWidget(self._build_console())
+        splitter.handle(1).setToolTip("Перетащите разделитель, чтобы изменить ширину SSH-вывода")
         splitter.setSizes([780, 440])
         return splitter
 
     def _build_console(self) -> QWidget:
         panel = QWidget(objectName="consolePanel")
-        panel.setMinimumWidth(350)
-        panel.setMaximumWidth(620)
+        panel.setMinimumWidth(320)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(18, 23, 18, 18)
         layout.setSpacing(11)
@@ -261,11 +270,26 @@ class MainWindow(QMainWindow):
         command_row.addWidget(run_button)
         layout.addLayout(command_row)
         terminal_tools = QHBoxLayout()
+        self.widen_console_btn = QPushButton("Шире", objectName="ghost")
+        self.widen_console_btn.setToolTip("Расширить SSH-вывод; повторное нажатие вернёт прежнюю ширину")
+        self.widen_console_btn.clicked.connect(self._toggle_console_width)
+        terminal_tools.addWidget(self.widen_console_btn)
         terminal_tools.addStretch()
         terminal_tools.addWidget(interrupt_button)
         terminal_tools.addWidget(clear_button)
         layout.addLayout(terminal_tools)
         return panel
+
+    def _toggle_console_width(self) -> None:
+        if self._saved_splitter_sizes is None:
+            sizes = self.workspace_splitter.sizes()
+            self._saved_splitter_sizes = sizes if all(sizes) else [780, 440]
+            self.workspace_splitter.setSizes([440, max(320, sum(self._saved_splitter_sizes) - 440)])
+            self.widen_console_btn.setText("Вернуть ширину")
+        else:
+            self.workspace_splitter.setSizes(self._saved_splitter_sizes)
+            self._saved_splitter_sizes = None
+            self.widen_console_btn.setText("Шире")
 
     def _load_servers(self, select_id: int | None = None) -> None:
         self.servers = self.db.list_servers()
@@ -361,8 +385,8 @@ class MainWindow(QMainWindow):
 
             actions = QWidget()
             actions_layout = QHBoxLayout(actions)
-            actions_layout.setContentsMargins(3, 3, 3, 3)
-            actions_layout.setSpacing(5)
+            actions_layout.setContentsMargins(2, 2, 2, 2)
+            actions_layout.setSpacing(4)
             actions_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             for action, color, tooltip in (
                 ("start", "#58d9a5", "Запустить"),
@@ -372,8 +396,8 @@ class MainWindow(QMainWindow):
             ):
                 button = QPushButton(objectName=f"service{action.capitalize()}")
                 button.setIcon(service_icon(action, color))
-                button.setIconSize(QSize(18, 18))
-                button.setFixedSize(34, 32)
+                button.setIconSize(QSize(16, 16))
+                button.setFixedSize(29, 28)
                 button.setToolTip(tooltip)
                 button.setAccessibleName(tooltip)
                 button.clicked.connect(partial(self._run_service_action, service, action, row))
@@ -383,19 +407,19 @@ class MainWindow(QMainWindow):
             more = QWidget()
             more_layout = QHBoxLayout(more)
             more_layout.setContentsMargins(2, 2, 2, 2)
-            more_layout.setSpacing(5)
+            more_layout.setSpacing(4)
             more_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
             edit = QPushButton(objectName="serviceEdit")
             edit.setIcon(service_icon("edit", "#a8b9d0"))
-            edit.setIconSize(QSize(18, 18))
-            edit.setFixedSize(34, 32)
+            edit.setIconSize(QSize(16, 16))
+            edit.setFixedSize(29, 28)
             edit.setToolTip("Изменить")
             edit.setAccessibleName("Изменить")
             edit.clicked.connect(partial(self._edit_service, service))
             delete = QPushButton(objectName="serviceDelete")
             delete.setIcon(service_icon("delete", "#ef8294"))
-            delete.setIconSize(QSize(18, 18))
-            delete.setFixedSize(34, 32)
+            delete.setIconSize(QSize(16, 16))
+            delete.setFixedSize(29, 28)
             delete.setToolTip("Удалить")
             delete.setAccessibleName("Удалить")
             delete.clicked.connect(partial(self._delete_service, service))

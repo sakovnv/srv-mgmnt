@@ -236,3 +236,39 @@ def test_new_services_from_status_require_confirmation(tmp_path, monkeypatch):
         assert db.list_services(other.id) == []
     finally:
         window.close()
+
+
+def test_compact_table_status_width_and_console_expansion(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    database_path = tmp_path / "layout-ui.db"
+    monkeypatch.setenv("MICROFLEET_DB_PATH", str(database_path))
+    db = Database(database_path)
+    server = db.save_server(Server(
+        name="production", host="example.invalid", ssh_user="deploy", auth_type="password",
+    ))
+    db.save_service(Microservice(server_id=server.id, name="orders"))
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+    try:
+        assert window.service_table.verticalHeader().defaultSectionSize() == 46
+        buttons = window.service_table.cellWidget(0, 3).findChildren(QPushButton)
+        assert all(button.size().width() == 29 and button.size().height() == 28 for button in buttons)
+
+        status_width = window.service_table.columnWidth(2)
+        splitter_sizes = window.workspace_splitter.sizes()
+        for state in ("checking", "running", "stopped", "error"):
+            window._set_service_status(server.id, "orders", state)
+            app.processEvents()
+            assert window.service_table.columnWidth(2) == status_width
+            assert window.workspace_splitter.sizes() == splitter_sizes
+
+        window.widen_console_btn.click()
+        app.processEvents()
+        assert window.workspace_splitter.sizes()[1] > splitter_sizes[1]
+        window.widen_console_btn.click()
+        app.processEvents()
+        assert abs(window.workspace_splitter.sizes()[1] - splitter_sizes[1]) <= 2
+    finally:
+        window.close()
