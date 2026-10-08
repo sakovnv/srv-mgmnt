@@ -1,5 +1,5 @@
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from microfleet.database import Database
 from microfleet.main_window import MainWindow
@@ -32,6 +32,14 @@ def test_service_buttons_send_common_script_command(tmp_path, monkeypatch):
     monkeypatch.setattr(window, "_session_for_command", lambda _server: fake_session)
     monkeypatch.setattr(window.credential_store, "get_dek", lambda: None)
     try:
+        action_buttons = window.service_table.cellWidget(0, 3).findChildren(QPushButton)
+        extra_buttons = window.service_table.cellWidget(0, 4).findChildren(QPushButton)
+        assert {button.objectName() for button in action_buttons + extra_buttons} == {
+            "serviceStart", "serviceStop", "serviceRestart", "serviceStatus",
+            "serviceEdit", "serviceDelete",
+        }
+        assert all(button.text() == "" and not button.icon().isNull() for button in action_buttons + extra_buttons)
+        assert all(button.toolTip() and button.accessibleName() for button in action_buttons + extra_buttons)
         window._run_service_action(window.services[0], "restart", 0)
         window._run_all_action("status")
         assert fake_session.commands == [

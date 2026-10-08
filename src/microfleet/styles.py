@@ -26,6 +26,25 @@ QPushButton#primary:hover { background: #5b76ff; }
 QPushButton#danger { color: #ff8fa3; }
 QPushButton#ghost { background: transparent; border-color: transparent; padding: 5px 8px; }
 QPushButton#ghost:hover { background: #192230; border-color: #273548; }
+QPushButton#serviceStart, QPushButton#serviceStop, QPushButton#serviceRestart,
+QPushButton#serviceStatus, QPushButton#serviceEdit, QPushButton#serviceDelete {
+    border-radius: 8px; padding: 0; min-width: 32px; min-height: 30px;
+}
+QPushButton#serviceStart { background: #13281f; border-color: #285a43; }
+QPushButton#serviceStart:hover { background: #1b3d2e; border-color: #58d9a5; }
+QPushButton#serviceStop { background: #2d1a23; border-color: #613041; }
+QPushButton#serviceStop:hover { background: #482431; border-color: #ef8294; }
+QPushButton#serviceRestart { background: #1b2440; border-color: #394b84; }
+QPushButton#serviceRestart:hover { background: #29365d; border-color: #8fa6ff; }
+QPushButton#serviceStatus { background: #2b271b; border-color: #5b4b2c; }
+QPushButton#serviceStatus:hover { background: #413920; border-color: #f0c979; }
+QPushButton#serviceEdit { background: #1b2532; border-color: #334459; }
+QPushButton#serviceEdit:hover { background: #27364a; border-color: #a8b9d0; }
+QPushButton#serviceDelete { background: #241a22; border-color: #4d2e3b; }
+QPushButton#serviceDelete:hover { background: #3b2330; border-color: #ef8294; }
+QPushButton#serviceStart:pressed, QPushButton#serviceStop:pressed,
+QPushButton#serviceRestart:pressed, QPushButton#serviceStatus:pressed,
+QPushButton#serviceEdit:pressed, QPushButton#serviceDelete:pressed { background: #0f151d; }
 QListWidget {
     background: transparent; border: none; outline: none; padding: 2px;
 }

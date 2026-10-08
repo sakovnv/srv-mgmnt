@@ -6,7 +6,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QSize, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -31,6 +31,7 @@ from .database import Database
 from .credentials import CredentialStore
 from .dek import DekAutomation
 from .dialogs import DekDialog, ServerDialog, ServiceDialog
+from .icons import service_icon
 from .models import Microservice, Server
 from .ssh import ConnectionSecret, SSHSession, clean_terminal_output, service_shell_command
 from .status import parse_all_statuses, parse_service_name, parse_status
@@ -362,10 +363,19 @@ class MainWindow(QMainWindow):
             actions_layout = QHBoxLayout(actions)
             actions_layout.setContentsMargins(3, 3, 3, 3)
             actions_layout.setSpacing(5)
-            for label, action in (("▶", "start"), ("■", "stop"), ("↻", "restart"), ("?", "status")):
-                button = QPushButton(label)
-                button.setFixedSize(31, 29)
-                button.setToolTip({"start": "Запустить", "stop": "Остановить", "restart": "Перезапустить", "status": "Проверить статус"}[action])
+            actions_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            for action, color, tooltip in (
+                ("start", "#58d9a5", "Запустить"),
+                ("stop", "#ef8294", "Остановить"),
+                ("restart", "#8fa6ff", "Перезапустить"),
+                ("status", "#f0c979", "Проверить статус"),
+            ):
+                button = QPushButton(objectName=f"service{action.capitalize()}")
+                button.setIcon(service_icon(action, color))
+                button.setIconSize(QSize(18, 18))
+                button.setFixedSize(34, 32)
+                button.setToolTip(tooltip)
+                button.setAccessibleName(tooltip)
                 button.clicked.connect(partial(self._run_service_action, service, action, row))
                 actions_layout.addWidget(button)
             self.service_table.setCellWidget(row, 3, actions)
@@ -373,11 +383,21 @@ class MainWindow(QMainWindow):
             more = QWidget()
             more_layout = QHBoxLayout(more)
             more_layout.setContentsMargins(2, 2, 2, 2)
-            edit = QPushButton("✎", objectName="ghost")
+            more_layout.setSpacing(5)
+            more_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            edit = QPushButton(objectName="serviceEdit")
+            edit.setIcon(service_icon("edit", "#a8b9d0"))
+            edit.setIconSize(QSize(18, 18))
+            edit.setFixedSize(34, 32)
             edit.setToolTip("Изменить")
+            edit.setAccessibleName("Изменить")
             edit.clicked.connect(partial(self._edit_service, service))
-            delete = QPushButton("×", objectName="ghost")
+            delete = QPushButton(objectName="serviceDelete")
+            delete.setIcon(service_icon("delete", "#ef8294"))
+            delete.setIconSize(QSize(18, 18))
+            delete.setFixedSize(34, 32)
             delete.setToolTip("Удалить")
+            delete.setAccessibleName("Удалить")
             delete.clicked.connect(partial(self._delete_service, service))
             more_layout.addWidget(edit)
             more_layout.addWidget(delete)
