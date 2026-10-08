@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt
+from PySide6.QtCore import QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,10 +28,13 @@ from PySide6.QtWidgets import (
 )
 
 from .database import Database
-from .dialogs import ServerDialog, ServiceDialog
+from .credentials import CredentialStore
+from .dek import DekAutomation
+from .dialogs import DekDialog, ServerDialog, ServiceDialog
 from .models import Microservice, Server
 from .ssh import ConnectionSecret, SSHSession, clean_terminal_output, service_shell_command
-from .status import parse_all_statuses
+from .status import parse_all_statuses, parse_status
+from .storage import prepare_database_path
 from .terminal import AnsiTerminalRenderer
 
 
@@ -43,9 +45,10 @@ class MainWindow(QMainWindow):
         self.resize(1440, 830)
         self.setMinimumSize(1080, 650)
 
-        custom_db = os.environ.get("MICROFLEET_DB_PATH")
         app_dir = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
-        self.db = Database(Path(custom_db) if custom_db else app_dir / "microfleet.db")
+        database_path, migration_warnings = prepare_database_path(app_dir / "microfleet.db")
+        self.db = Database(database_path)
+        self.credential_store = CredentialStore(self.db.path)
         self.servers: list[Server] = []
         self.services: list[Microservice] = []
         self.active_server: Server | None = None
@@ -55,10 +58,21 @@ class MainWindow(QMainWindow):
         self.service_statuses: dict[int, dict[str, str]] = {}
         self.status_line_buffers: dict[int, str] = {}
         self.passwords: dict[int, str] = {}
+        self.dek_password = ""
+        self.dek_automations: dict[int, DekAutomation] = {}
         self.sessions: dict[int, SSHSession] = {}
 
         self._build_ui()
         self._load_servers()
+        if migration_warnings:
+            QTimer.singleShot(
+                0,
+                lambda: QMessageBox.warning(
+                    self, "Не все пароли перенесены",
+                    "Список серверов перенесён, но некоторые пароли нужно ввести заново:\n"
+                    + "\n".join(migration_warnings),
+                ),
+            )
 
     def _build_ui(self) -> None:
         root = QWidget(objectName="root")
@@ -104,6 +118,10 @@ class MainWindow(QMainWindow):
 
         self.server_count = QLabel("0 серверов", objectName="muted")
         layout.addWidget(self.server_count)
+        dek_button = QPushButton("DEK-пароль")
+        dek_button.setToolTip("Общий DEK-пароль текущего пользователя для всех серверов")
+        dek_button.clicked.connect(self._edit_dek_password)
+        layout.addWidget(dek_button)
         return sidebar
 
     def _build_workspace(self) -> QWidget:
@@ -311,7 +329,7 @@ class MainWindow(QMainWindow):
         self._set_state_label(self.server_states.get(server.id or 0, "offline"))
         self.services = self.db.list_services(server.id or 0)
         self._render_services()
-        if server.auth_type != "password" or self.passwords.get(server.id or 0):
+        if server.auth_type != "password" or self._password_for_server(server, quiet=True):
             self._connect_server(server, quiet=True)
 
     def _render_services(self) -> None:
@@ -358,31 +376,85 @@ class MainWindow(QMainWindow):
             self.service_table.setCellWidget(row, 4, more)
 
     def _add_server(self) -> None:
-        dialog = ServerDialog(parent=self)
+        dialog = ServerDialog(
+            parent=self, secure_storage_available=self.credential_store.available
+        )
         if dialog.exec():
-            server, password = dialog.result_data()
+            server, password, remember = dialog.result_data()
             try:
                 self.db.save_server(server)
             except Exception as exc:
                 self._show_db_error(exc)
                 return
-            if password and server.id:
+            if password and server.id and server.auth_type == "password":
                 self.passwords[server.id] = password
+                if remember:
+                    self._store_password(server, password)
             self._load_servers(server.id)
+
+    def _edit_dek_password(self) -> None:
+        try:
+            stored_password = self.credential_store.get_dek() or ""
+        except Exception as exc:
+            QMessageBox.warning(self, "Хранилище DEK-пароля", str(exc))
+            stored_password = ""
+        saved = bool(stored_password)
+        dialog = DekDialog(
+            secure_storage_available=self.credential_store.available,
+            password_saved=saved,
+            parent=self,
+        )
+        if not dialog.exec():
+            return
+        password, remember = dialog.result_data()
+        if not remember:
+            try:
+                self.credential_store.delete_dek()
+            except Exception as exc:
+                QMessageBox.warning(self, "Не удалось удалить DEK-пароль", str(exc))
+                return
+            self.dek_password = password
+            return
+        if password:
+            self.dek_password = password
+        elif not self.dek_password and saved:
+            self.dek_password = stored_password
+        if self.dek_password and self.credential_store.available:
+            try:
+                self.credential_store.set_dek(self.dek_password)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "DEK-пароль не сохранён",
+                    f"Не удалось сохранить DEK-пароль в Windows: {exc}\n"
+                    "До закрытия приложения он останется доступен в памяти.",
+                )
 
     def _edit_server(self) -> None:
         if not self.active_server:
             return
         original = self.active_server
-        dialog = ServerDialog(replace(original), self)
+        try:
+            password_saved = bool(self.credential_store.get(original))
+        except Exception as exc:
+            QMessageBox.warning(self, "Хранилище паролей", str(exc))
+            password_saved = False
+        dialog = ServerDialog(
+            replace(original), self,
+            secure_storage_available=self.credential_store.available,
+            password_saved=password_saved,
+        )
         if dialog.exec():
-            server, password = dialog.result_data()
+            server, password, remember = dialog.result_data()
             try:
                 self.db.save_server(server)
             except Exception as exc:
                 self._show_db_error(exc)
                 return
             connection_fields = ("host", "port", "ssh_user", "run_as_user", "auth_type", "key_path")
+            identity_changed = any(
+                getattr(original, field) != getattr(server, field)
+                for field in ("host", "port", "ssh_user")
+            )
             connection_changed = password or any(
                 getattr(original, field) != getattr(server, field) for field in connection_fields
             )
@@ -392,8 +464,15 @@ class MainWindow(QMainWindow):
                     old_session.stop()
                     old_session.wait(9000)
                 self.server_states[server.id] = "offline"
-            if password and server.id:
-                self.passwords[server.id] = password
+            if server.id is not None:
+                if identity_changed or server.auth_type != "password" or not remember:
+                    self._delete_stored_password(original)
+                if identity_changed or server.auth_type != "password":
+                    self.passwords.pop(server.id, None)
+                if password and server.auth_type == "password":
+                    self.passwords[server.id] = password
+                    if remember:
+                        self._store_password(server, password)
             self._load_servers(server.id)
 
     def _delete_server(self) -> None:
@@ -406,6 +485,11 @@ class MainWindow(QMainWindow):
             f"Сервер «{server.name}» и все его микросервисы будут удалены из приложения.",
         )
         if answer == QMessageBox.StandardButton.Yes:
+            try:
+                self.credential_store.delete(server)
+            except Exception as exc:
+                QMessageBox.warning(self, "Не удалось удалить пароль", str(exc))
+                return
             self._stop_session(server.id)
             self.db.delete_server(server.id)
             self.console_buffers.pop(server.id, None)
@@ -482,19 +566,68 @@ class MainWindow(QMainWindow):
         self, server: Server, script_path: str, action: str, target: str,
         session: SSHSession | None = None,
     ) -> bool:
+        server_id = int(server.id or 0)
+        if server_id in self.dek_automations:
+            QMessageBox.information(
+                self, "Команда выполняется",
+                "Дождитесь завершения текущего запуска или прервите его кнопкой Ctrl+C.",
+            )
+            return False
         session = session or self._session_for_command(server)
         if session is None:
             return False
         command = service_shell_command(script_path, action, target)
+        automation = None
+        if action != "status":
+            status_command = service_shell_command(script_path, "status", target)
+            if action in {"start", "restart"}:
+                command = f"stty -echo; {command}; stty echo; {status_command}"
+                dek_password = self._dek_password_for_user(server_id)
+                if dek_password:
+                    names = (
+                        {service.name for service in self.db.list_services(server_id)}
+                        if target == "all" else {target}
+                    )
+                    automation = DekAutomation(dek_password, names)
+                    self.dek_automations[server_id] = automation
+            if action not in {"start", "restart"}:
+                command = f"{command}; {status_command}"
         if session.send_command(command):
-            if action != "status":
-                session.send_command(service_shell_command(script_path, "status", target))
             return True
+        self.dek_automations.pop(server_id, None)
         QMessageBox.warning(self, "SSH-сессия закрыта", "Подключитесь к серверу и повторите команду.")
         return False
 
+    def _dek_password_for_user(self, server_id: int) -> str:
+        if self.dek_password:
+            return self.dek_password
+        try:
+            self.dek_password = self.credential_store.get_dek() or ""
+        except Exception as exc:
+            self._append_console(
+                server_id, f"\nНе удалось прочитать сохранённый DEK-пароль: {exc}\n"
+            )
+        return self.dek_password
+
+    def _finish_dek_automation(self, server_id: int, *, aborted: bool = False) -> None:
+        automation = self.dek_automations.pop(server_id, None)
+        if automation is not None and not aborted:
+            visible = automation.redactor.finish()
+            if visible:
+                self._append_console(server_id, visible)
+
     def _on_ssh_output(self, server_id: int, text: str) -> None:
-        self._append_console(server_id, text)
+        automation = self.dek_automations.get(server_id)
+        if automation is not None:
+            session = self.sessions.get(server_id)
+            for component in automation.responder.feed(text):
+                if session is not None:
+                    session.send_command(component)
+            visible = automation.redactor.feed(text)
+        else:
+            visible = text
+        if visible:
+            self._append_console(server_id, visible)
         buffered = self.status_line_buffers.get(server_id, "") + text
         lines = re.split(r"\r\n|\r|\n", buffered)
         self.status_line_buffers[server_id] = lines.pop()[-4096:]
@@ -502,8 +635,16 @@ class MainWindow(QMainWindow):
         for line in [*lines, self.status_line_buffers[server_id]]:
             if not re.match(r"^\s*Checking\s+service\s+", clean_terminal_output(line), re.I):
                 continue
+            if automation is not None and automation.complete_on_any_status:
+                automation.saw_status_line |= parse_status(line) is not None
             for name, state in parse_all_statuses(line, names).items():
                 self._set_service_status(server_id, name, state)
+                if automation is not None:
+                    automation.expected_names.discard(name)
+        if automation is not None and not automation.expected_names and (
+            not automation.complete_on_any_status or automation.saw_status_line
+        ):
+            self._finish_dek_automation(server_id)
 
     def _set_service_status(self, server_id: int, service_name: str, state: str) -> None:
         self.service_statuses.setdefault(server_id, {})[service_name] = state
@@ -546,6 +687,12 @@ class MainWindow(QMainWindow):
         raw = self.command_input.text().strip()
         if not server or not raw:
             return
+        if server.id in self.dek_automations:
+            QMessageBox.information(
+                self, "Команда выполняется",
+                "Дождитесь завершения запуска с DEK или прервите его кнопкой Ctrl+C.",
+            )
+            return
         self.command_input.clear()
         session = self._session_for_command(server)
         if session is not None:
@@ -566,14 +713,14 @@ class MainWindow(QMainWindow):
         current = self.sessions.get(server_id)
         if current and current.isRunning():
             return current
-        password = self.passwords.get(server_id, "")
+        password = self._password_for_server(server, quiet=quiet)
         if server.auth_type == "password" and not password:
             if not quiet:
                 QMessageBox.information(
                     self,
                     "Требуется пароль",
                     "Откройте «Параметры» сервера и введите SSH-пароль. "
-                    "Он останется только в памяти до закрытия приложения.",
+                    "При сохранении его можно оставить в защищённом хранилище Windows.",
                 )
             return None
         session = SSHSession(server, ConnectionSecret(password), parent=self)
@@ -589,6 +736,38 @@ class MainWindow(QMainWindow):
         session.start()
         return session
 
+    def _password_for_server(self, server: Server, quiet: bool = False) -> str:
+        server_id = int(server.id or 0)
+        if server_id in self.passwords:
+            return self.passwords[server_id]
+        if server.auth_type != "password":
+            return ""
+        try:
+            password = self.credential_store.get(server)
+        except Exception as exc:
+            if not quiet:
+                QMessageBox.warning(self, "Не удалось прочитать SSH-пароль", str(exc))
+            return ""
+        if password:
+            self.passwords[server_id] = password
+        return password or ""
+
+    def _store_password(self, server: Server, password: str) -> None:
+        try:
+            self.credential_store.set(server, password)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Пароль не сохранён",
+                f"Не удалось сохранить пароль в Windows: {exc}\n"
+                "До закрытия приложения он останется доступен в памяти.",
+            )
+
+    def _delete_stored_password(self, server: Server) -> None:
+        try:
+            self.credential_store.delete(server)
+        except Exception as exc:
+            QMessageBox.warning(self, "Не удалось удалить сохранённый пароль", str(exc))
+
     def _session_for_command(self, server: Server) -> SSHSession | None:
         session = self._connect_server(server)
         if session is None:
@@ -602,6 +781,7 @@ class MainWindow(QMainWindow):
 
     def _session_finished(self, session: SSHSession, server_id: int, reason: str) -> None:
         if self.sessions.get(server_id) is session:
+            self._finish_dek_automation(server_id, aborted=True)
             self.sessions.pop(server_id, None)
             self.status_line_buffers.pop(server_id, None)
             for name, state in self.service_statuses.get(server_id, {}).copy().items():
@@ -660,6 +840,7 @@ class MainWindow(QMainWindow):
             return
         session = self.sessions.get(self.active_server.id)
         if session and session.isRunning():
+            self._finish_dek_automation(self.active_server.id, aborted=True)
             session.send_interrupt()
 
     @staticmethod

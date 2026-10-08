@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .main_window import MainWindow
 from .styles import APP_STYLESHEET
@@ -25,11 +26,17 @@ def main() -> int:
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     app.setPalette(palette)
     app.setStyleSheet(APP_STYLESHEET)
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except (OSError, sqlite3.DatabaseError) as exc:
+        QMessageBox.critical(
+            None, "Не удалось открыть настройки MicroFleet",
+            f"Проверьте права на папку config/users рядом с приложением.\n\n{exc}",
+        )
+        return 1
     window.show()
     return app.exec()
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -16,10 +18,14 @@ from PySide6.QtWidgets import (
 )
 
 from .models import Microservice, Server
+from .dek import split_dek_password
 
 
 class ServerDialog(QDialog):
-    def __init__(self, server: Server | None = None, parent=None) -> None:
+    def __init__(
+        self, server: Server | None = None, parent=None,
+        *, secure_storage_available: bool = False, password_saved: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.server = server or Server()
         self.setWindowTitle("Параметры сервера")
@@ -55,7 +61,13 @@ class ServerDialog(QDialog):
         key_row.addWidget(browse)
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password.setPlaceholderText("Не сохраняется; только для текущего запуска")
+        self.password.setPlaceholderText(
+            "Пароль сохранён; оставьте пустым, чтобы не менять"
+            if password_saved else "Введите SSH-пароль"
+        )
+        self.remember_password = QCheckBox("Сохранять в Диспетчере учётных данных Windows")
+        self.remember_password.setChecked(secure_storage_available)
+        self.remember_password.setVisible(secure_storage_available)
         self.notes = QTextEdit(self.server.notes)
         self.notes.setMaximumHeight(70)
 
@@ -71,6 +83,7 @@ class ServerDialog(QDialog):
         form.addRow("Авторизация", self.auth_type)
         form.addRow("Приватный ключ", key_row)
         form.addRow("SSH-пароль", self.password)
+        form.addRow("", self.remember_password)
         form.addRow("Заметки", self.notes)
 
         buttons = QDialogButtonBox(
@@ -94,6 +107,7 @@ class ServerDialog(QDialog):
         is_key = self.auth_type.currentData() == "key"
         self.key_path.setEnabled(is_key)
         self.password.setEnabled(not is_key)
+        self.remember_password.setEnabled(not is_key)
 
     def _browse_key(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Выберите приватный SSH-ключ")
@@ -106,7 +120,7 @@ class ServerDialog(QDialog):
             return
         self.accept()
 
-    def result_data(self) -> tuple[Server, str]:
+    def result_data(self) -> tuple[Server, str, bool]:
         self.server.name = self.name.text().strip()
         self.server.group_name = self.group.text().strip()
         self.server.host = self.host.text().strip()
@@ -117,7 +131,60 @@ class ServerDialog(QDialog):
         self.server.auth_type = str(self.auth_type.currentData())
         self.server.key_path = self.key_path.text().strip()
         self.server.notes = self.notes.toPlainText().strip()
-        return self.server, self.password.text()
+        return self.server, self.password.text(), self.remember_password.isChecked()
+
+
+class DekDialog(QDialog):
+    def __init__(
+        self, *, secure_storage_available: bool, password_saved: bool, parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("DEK-пароль")
+        self.setMinimumWidth(460)
+        self.setModal(True)
+
+        explanation = QLabel(
+            "Один DEK-пароль для всех серверов текущего пользователя. "
+            "Приложение разделит его на две части при запуске и рестарте сервиса."
+        )
+        explanation.setWordWrap(True)
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText(
+            "Пароль сохранён; оставьте пустым, чтобы не менять"
+            if password_saved else "Введите полный DEK-пароль"
+        )
+        self.remember = QCheckBox("Сохранять в Диспетчере учётных данных Windows")
+        self.remember.setChecked(secure_storage_available)
+        self.remember.setVisible(secure_storage_available)
+        form = QFormLayout()
+        form.addRow("Полный DEK-пароль", self.password)
+        form.addRow("", self.remember)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Save).setObjectName("primary")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self._validate)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 18)
+        layout.addWidget(explanation)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def _validate(self) -> None:
+        if self.password.text():
+            try:
+                split_dek_password(self.password.text())
+            except ValueError as exc:
+                QMessageBox.warning(self, "Недопустимый DEK-пароль", str(exc))
+                return
+        self.accept()
+
+    def result_data(self) -> tuple[str, bool]:
+        return self.password.text(), self.remember.isChecked()
 
 
 class ServiceDialog(QDialog):
