@@ -1,4 +1,5 @@
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from microfleet.database import Database
 from microfleet.main_window import MainWindow
@@ -171,5 +172,59 @@ def test_saved_password_is_loaded_on_next_launch(tmp_path, monkeypatch):
     try:
         assert window.passwords[server.id] == "saved-secret"
         assert connections == [(server.id, True)]
+    finally:
+        window.close()
+
+
+def test_new_services_from_status_require_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    database_path = tmp_path / "discovery-ui.db"
+    monkeypatch.setenv("MICROFLEET_DB_PATH", str(database_path))
+    db = Database(database_path)
+    server = db.save_server(Server(
+        name="production", host="example.invalid", ssh_user="deploy",
+        auth_type="password", management_script_path="/opt/manage.sh",
+    ))
+    other = db.save_server(Server(
+        name="mirror", host="mirror.invalid", ssh_user="deploy", auth_type="password",
+    ))
+    db.save_service(Microservice(server_id=server.id, name="existing-service"))
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    decisions = iter((QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes))
+    prompts = []
+
+    def confirm(_parent, _title, message):
+        prompts.append(message)
+        return next(decisions)
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    try:
+        for row in range(window.server_list.count()):
+            if window.server_list.item(row).data(Qt.ItemDataRole.UserRole) == server.id:
+                window.server_list.setCurrentRow(row)
+                break
+        window._on_ssh_output(server.id, 'Checking service "existing-service" ..... running.\n')
+        window._on_ssh_output(server.id, 'Checking service "new-')
+        assert not window._pending_discovered(server.id)
+        window._on_ssh_output(server.id, 'service" .....')
+        window._on_ssh_output(server.id, ' running.\nChecking service "second-service" ..... stopped.\n')
+        window._on_ssh_output(server.id, 'Checking service "NEW-SERVICE" ..... running.\n')
+        assert window._pending_discovered(server.id) == ["new-service", "second-service"]
+        assert window.add_discovered_btn.text() == "Добавить найденные (2)"
+        assert [service.name for service in db.list_services(server.id)] == ["existing-service"]
+
+        window._add_discovered_services()
+        assert len(prompts) == 1
+        assert "new-service" in prompts[0] and "second-service" in prompts[0]
+        assert [service.name for service in db.list_services(server.id)] == ["existing-service"]
+
+        window._add_discovered_services()
+        assert {service.name for service in db.list_services(server.id)} == {
+            "existing-service", "new-service", "second-service",
+        }
+        assert window.service_statuses[server.id]["new-service"] == "running"
+        assert not window._pending_discovered(server.id)
+        assert db.list_services(other.id) == []
     finally:
         window.close()

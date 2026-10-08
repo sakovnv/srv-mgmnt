@@ -33,7 +33,7 @@ from .dek import DekAutomation
 from .dialogs import DekDialog, ServerDialog, ServiceDialog
 from .models import Microservice, Server
 from .ssh import ConnectionSecret, SSHSession, clean_terminal_output, service_shell_command
-from .status import parse_all_statuses, parse_status
+from .status import parse_all_statuses, parse_service_name, parse_status
 from .storage import prepare_database_path
 from .terminal import AnsiTerminalRenderer
 
@@ -56,6 +56,7 @@ class MainWindow(QMainWindow):
         self.terminal_renderer = AnsiTerminalRenderer()
         self.server_states: dict[int, str] = {}
         self.service_statuses: dict[int, dict[str, str]] = {}
+        self.discovered_services: dict[int, dict[str, str]] = {}
         self.status_line_buffers: dict[int, str] = {}
         self.passwords: dict[int, str] = {}
         self.dek_password = ""
@@ -152,6 +153,11 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("МИКРОСЕРВИСЫ", objectName="sectionTitle"))
         toolbar.addStretch()
+        self.add_discovered_btn = QPushButton("Добавить найденные")
+        self.add_discovered_btn.setToolTip("Добавить сервисы, найденные в SSH-выводе status")
+        self.add_discovered_btn.clicked.connect(self._add_discovered_services)
+        self.add_discovered_btn.hide()
+        toolbar.addWidget(self.add_discovered_btn)
         self.add_service_btn = QPushButton("＋  Добавить микросервис", objectName="primary")
         self.add_service_btn.clicked.connect(self._add_service)
         toolbar.addWidget(self.add_service_btn)
@@ -314,6 +320,7 @@ class MainWindow(QMainWindow):
             self._set_state_label("offline")
             self.services = []
             self._render_services()
+            self._update_discovered_button()
             return
         self.page_title.setText(server.name)
         run_as = server.run_as_user or server.ssh_user
@@ -329,6 +336,7 @@ class MainWindow(QMainWindow):
         self._set_state_label(self.server_states.get(server.id or 0, "offline"))
         self.services = self.db.list_services(server.id or 0)
         self._render_services()
+        self._update_discovered_button()
         if server.auth_type != "password" or self._password_for_server(server, quiet=True):
             self._connect_server(server, quiet=True)
 
@@ -494,6 +502,7 @@ class MainWindow(QMainWindow):
             self.db.delete_server(server.id)
             self.console_buffers.pop(server.id, None)
             self.service_statuses.pop(server.id, None)
+            self.discovered_services.pop(server.id, None)
             self.status_line_buffers.pop(server.id, None)
             self.passwords.pop(server.id, None)
             self.active_server = None
@@ -505,7 +514,8 @@ class MainWindow(QMainWindow):
         dialog = ServiceDialog(self.active_server.id, parent=self)
         if dialog.exec():
             try:
-                self.db.save_service(dialog.result_data())
+                service = self.db.save_service(dialog.result_data())
+                self.discovered_services.get(service.server_id, {}).pop(service.name.casefold(), None)
                 self._activate_server(self.active_server)
             except Exception as exc:
                 self._show_db_error(exc)
@@ -525,6 +535,47 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "Удалить микросервис?", f"Удалить «{service.name}» из списка?") == QMessageBox.StandardButton.Yes:
             self.db.delete_service(service.id)
             self._activate_server(self.active_server)
+
+    def _pending_discovered(self, server_id: int) -> list[str]:
+        existing = {service.name.casefold() for service in self.db.list_services(server_id)}
+        return [
+            name for key, name in self.discovered_services.get(server_id, {}).items()
+            if key not in existing
+        ]
+
+    def _update_discovered_button(self) -> None:
+        server_id = self.active_server.id if self.active_server else None
+        names = self._pending_discovered(server_id) if server_id is not None else []
+        self.add_discovered_btn.setVisible(bool(names))
+        if names:
+            self.add_discovered_btn.setText(f"Добавить найденные ({len(names)})")
+
+    def _add_discovered_services(self) -> None:
+        server = self.active_server
+        if server is None or server.id is None:
+            return
+        names = self._pending_discovered(server.id)
+        if not names:
+            self._update_discovered_button()
+            return
+        message = "Добавить найденные микросервисы на сервер «{}»?\n\n{}".format(
+            server.name, "\n".join(f"• {name}" for name in names),
+        )
+        if QMessageBox.question(self, "Добавить микросервисы", message) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            for name in names:
+                self.db.save_service(Microservice(server_id=server.id, name=name))
+        except Exception as exc:
+            self._show_db_error(exc)
+        self.services = self.db.list_services(server.id)
+        saved = {service.name.casefold() for service in self.services}
+        pending = self.discovered_services.get(server.id, {})
+        for key in list(pending):
+            if key in saved:
+                pending.pop(key)
+        self._render_services()
+        self._update_discovered_button()
 
     def _run_service_action(self, service: Microservice, action: str, row: int) -> None:
         server = self.active_server
@@ -632,15 +683,28 @@ class MainWindow(QMainWindow):
         lines = re.split(r"\r\n|\r|\n", buffered)
         self.status_line_buffers[server_id] = lines.pop()[-4096:]
         names = [service.name for service in self.db.list_services(server_id)]
+        known_names = {name.casefold() for name in names}
+        found_new = False
         for line in [*lines, self.status_line_buffers[server_id]]:
             if not re.match(r"^\s*Checking\s+service\s+", clean_terminal_output(line), re.I):
                 continue
+            discovered = parse_service_name(line)
+            if discovered and discovered.casefold() not in known_names:
+                pending = self.discovered_services.setdefault(server_id, {})
+                if discovered.casefold() not in pending:
+                    pending[discovered.casefold()] = discovered
+                    found_new = True
+                state = parse_status(line)
+                if state is not None:
+                    self._set_service_status(server_id, pending[discovered.casefold()], state)
             if automation is not None and automation.complete_on_any_status:
                 automation.saw_status_line |= parse_status(line) is not None
             for name, state in parse_all_statuses(line, names).items():
                 self._set_service_status(server_id, name, state)
                 if automation is not None:
                     automation.expected_names.discard(name)
+        if found_new and self.active_server and self.active_server.id == server_id:
+            self._update_discovered_button()
         if automation is not None and not automation.expected_names and (
             not automation.complete_on_any_status or automation.saw_status_line
         ):

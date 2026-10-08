@@ -1,4 +1,4 @@
-from microfleet.status import parse_all_statuses, parse_status
+from microfleet.status import parse_all_statuses, parse_service_name, parse_status
 
 
 def test_status_parser_handles_negative_and_colored_output():
@@ -31,3 +31,10 @@ def test_unknown_service_does_not_set_all_statuses():
         'Checking service "other-service" ..... running.',
         ["issuing-service", "billing-api"],
     ) == {}
+
+
+def test_service_name_can_be_discovered_before_status_is_complete():
+    assert parse_service_name('\x1b[32mChecking service "new-service" .....') == "new-service"
+    assert parse_service_name('Checking service "all" ..... running.') is None
+    assert parse_service_name('Checking service "unfinished') is None
+    assert parse_service_name('Not a status line "new-service"') is None

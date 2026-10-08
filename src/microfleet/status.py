@@ -17,6 +17,18 @@ _CHECKING_SERVICE = re.compile(
     r"(?i)^\s*Checking\s+service\s+[\"'](?P<name>[^\"']+)[\"']"
     r"\s*\.{2,}\s*(?P<state>not\s+running|running|stopped|failed)\.?\s*$"
 )
+_SERVICE_NAME = re.compile(
+    r"(?i)^\s*Checking\s+service\s+[\"'](?P<name>[^\"'\r\n]+)[\"']"
+)
+
+
+def parse_service_name(text: str) -> str | None:
+    """Read a service name even while its status line is still being printed."""
+    match = _SERVICE_NAME.match(clean_terminal_output(text))
+    if match is None:
+        return None
+    name = match.group("name").strip()
+    return name if name and len(name) <= 255 and name.isprintable() and name.casefold() != "all" else None
 
 
 def parse_status(text: str) -> str | None:
